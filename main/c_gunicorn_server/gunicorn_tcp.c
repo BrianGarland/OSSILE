@@ -33,23 +33,57 @@ Sample ini:
 autostart = 1 ; whether to start/end with INSTANCE(*AUTOSTART). values: 0 or 1
 
 [sbmjob]
-user = qtmhhttp ; user to run SBMJOB under
+; user to run SBMJOB under
+user = qtmhhttp
 
 [gunicorn]
-bin_dir = /QOpenSys/QIBM/ProdData/OPS/Python3.4/bin ; Path where gunicorn & python are located
+; How to start the application server. values: <module name>:<app variable name>
+; REQUIRED
+app = sample:app
 
-workers = 2 ; Number of worker jobs to run. values: 1+ (default 1)
+; Path to where gunicorn & python are located
+bin_dir = /QOpenSys/QIBM/ProdData/OPS/Python3.4/bin
 
-app = sample:app ; How to start the application server. values: <module name>:<app variable name>
+; Path to where virtual environment is located.
+; NOTE: When venv set, bin_dir is ignored
+venv = /home/user/project/.venv
 
-app_path = /home/kadler/bottle-example ; Path to where your module is located, if not in the default Python Path
+; Number of worker jobs to run. values: 1+ (default 1)
+; Equivalent to --workers option
+; http://docs.gunicorn.org/en/latest/settings.html#workers
+workers = 2
 
-bind = 127.0.0.1:6000 ; Which host and port to bind to (default 127.0.0.1:5000)
+; Path to where your module is located, if not in the default Python Path
+; Equivalent to --pythonpath option
+; http://docs.gunicorn.org/en/latest/settings.html#pythonpath
+app_path = /home/kadler/bottle-example
+
+; Path where to run the server from
+; Equivalent to --chdir option
+; http://docs.gunicorn.org/en/latest/settings.html#chdir
+run_path = /home/kadler/bottle-example
+
+; Which host and port to bind to (default 127.0.0.1:5000)
+; Equivalent to --bind option
+; http://docs.gunicorn.org/en/latest/settings.html#bind
+bind = 127.0.0.1:5000
+
+; Path to the error log file (default is stderr)
+; Equivalent to --error-logfile option
+; http://docs.gunicorn.org/en/latest/settings.html#errorlog
+error_log = /QOpenSys/var/log/bottle.log
+
+; Redirect stdout & stderr to error log (default is false)
+; Equivalent to --capture-output option
+; http://docs.gunicorn.org/en/latest/settings.html#capture-output
+; Supports "true" or "false"
+capture_output = true
+
 
 
 Register it like so:
- ADDTCPSVR SVRSPCVAL(*GUNICORN) PGM(STRPYSRVR) SVRNAME('GUNICORN') +
-  SVRTYPE('GUNICORN') TEXT('Python gunicorn servers')
+ ADDTCPSVR SVRSPCVAL(*GUNICORN) PGM(OSSILE/GUNICORNTCP)
+ SVRNAME('GUNICORN') SVRTYPE('GUNICORN') TEXT('Python gunicorn servers')
 */
 
 #include <stdio.h>
@@ -112,6 +146,9 @@ typedef struct {
     char* run_path;
     char* bin_dir;
     char* bind;
+    char* venv;
+    char* error_log;
+    int capture_output;
     int workers;
     int autostart;
 } gunicorn_opts_t;
@@ -124,6 +161,8 @@ void free_opts(gunicorn_opts_t* opts)
     free(opts->run_path);
     free(opts->bin_dir);
     free(opts->bind);
+    free(opts->venv);
+    free(opts->error_log);
 }
 
 int handler(void* user, const char* section, const char* name, const char* value)
@@ -191,6 +230,18 @@ int handler(void* user, const char* section, const char* name, const char* value
         else if(strcmp(name, "bin_dir") == 0)
         {
             opts->bin_dir = strdup(value);
+        }
+        else if(strcmp(name, "venv") == 0)
+        {
+            opts->venv = strdup(value);
+        }
+        else if(strcmp(name, "error_log") == 0)
+        {
+            opts->error_log = strdup(value);
+        }
+        else if(strcmp(name, "capture_output") == 0)
+        {
+            opts->capture_output = strcmp(value, "true") == 0;
         }
         else
         {
@@ -399,94 +450,47 @@ int handle_instance(const char* action, const char* instance, int multiple, int 
         char command[MAX_SBMJOB_LEN + sizeof(QSH_CMD_STR) + 5000 + sizeof(QSH_CMD_END)];
         int len = 0;
         int offset = 0;
-        
-        len = sprintf(&command[offset], "QSYS/SBMJOB ALWMLTTHD(*YES)");
-        if(len < 0)
-        {
-            Qp0zLprintf("UNKNOWN ERROR: %d\n", errno);
-            rc = RC_FAILED;
-            goto end;
+
+#define APPEND_COMMAND_STRING(...) \
+        { \
+            len = sprintf(&command[offset], __VA_ARGS__); \
+            if(len < 0) \
+            { \
+                Qp0zLprintf("UNKNOWN ERROR: %d\n", errno); \
+                rc = RC_FAILED; \
+                goto end; \
+            } \
+            offset += len; \
         }
-        offset += len;
+
+        APPEND_COMMAND_STRING("QSYS/SBMJOB ALWMLTTHD(*YES)");
         
-        if(opts.user)
+        if(opts.user) APPEND_COMMAND_STRING(" USER(%s)", opts.user);
+
+        // set the FLASK_ENV to production
+        APPEND_COMMAND_STRING(" CMD(" QSH_CMD_STR "export FLASK_ENV=production;");
+
+        if(opts.venv) 
         {
-            len = sprintf(&command[offset], " USER(%s)", opts.user);
-            if(len < 0)
-            {
-                Qp0zLprintf("UNKNOWN ERROR: %d\n", errno);
-                rc = RC_FAILED;
-                goto end;
-            }
-            offset += len;
+            // activate the venv first
+            APPEND_COMMAND_STRING(" source %s/bin/activate; exec gunicorn", opts.venv);
+        } 
+        else 
+        {
+            const char* path = opts.bin_dir ? opts.bin_dir : "/QOpenSys/pkgs/bin";
+            APPEND_COMMAND_STRING(" exec %s/gunicorn", path);
         }
+
+        APPEND_COMMAND_STRING(" -D -p %s", pid_file);
+
+        if(opts.workers) APPEND_COMMAND_STRING(" -w %d", opts.workers);
+        if(opts.app_path) APPEND_COMMAND_STRING(" --pythonpath %s", opts.app_path);
+        if(opts.run_path) APPEND_COMMAND_STRING(" --chdir %s", opts.run_path);
+        if(opts.bind) APPEND_COMMAND_STRING(" --bind %s", opts.bind);
+        if(opts.error_log) APPEND_COMMAND_STRING(" --error-logfile %s", opts.error_log);
+        if(opts.capture_output) APPEND_COMMAND_STRING(" --capture-output");
         
-        const char* path = opts.bin_dir ? opts.bin_dir : "/QOpenSys/QIBM/ProdData/OPS/Python3.4/bin";
-        len = sprintf(&command[offset], " CMD(" QSH_CMD_STR "exec %s/gunicorn -D -p %s", path, pid_file);
-        if(len < 0)
-        {
-            Qp0zLprintf("UNKNOWN ERROR: %d\n", errno);
-            rc = RC_FAILED;
-            goto end;
-        }
-        offset += len;
-        
-        if(opts.workers)
-        {
-            len = sprintf(&command[offset], " -w %d", opts.workers);
-            if(len < 0)
-            {
-                Qp0zLprintf("UNKNOWN ERROR: %d\n", errno);
-                rc = RC_FAILED;
-                goto end;
-            }
-            offset += len;
-        }
-        
-        if(opts.app_path)
-        {
-            len = sprintf(&command[offset], " --pythonpath %s", opts.app_path);
-            if(len < 0)
-            {
-                Qp0zLprintf("UNKNOWN ERROR: %d\n", errno);
-                rc = RC_FAILED;
-                goto end;
-            }
-            offset += len;
-        }
-        
-        if(opts.run_path)
-        {
-            len = sprintf(&command[offset], " --chdir %s", opts.run_path);
-            if(len < 0)
-            {
-                Qp0zLprintf("UNKNOWN ERROR: %d\n", errno);
-                rc = RC_FAILED;
-                goto end;
-            }
-            offset += len;
-        }
-        
-        if(opts.bind)
-        {
-            len = sprintf(&command[offset], " --bind %s", opts.bind);
-            if(len < 0)
-            {
-                Qp0zLprintf("UNKNOWN ERROR: %d\n", errno);
-                rc = RC_FAILED;
-                goto end;
-            }
-            offset += len;
-        }
-        
-        len = sprintf(&command[offset], " %s" QSH_CMD_END ")", opts.app);
-        if(len < 0)
-        {
-            Qp0zLprintf("UNKNOWN ERROR: %d\n", errno);
-            rc = RC_FAILED;
-            goto end;
-        }
-        offset += len;
+        APPEND_COMMAND_STRING(" %s" QSH_CMD_END ")", opts.app);
         
         Qp0zLprintf("%s\n", command);
         rc = system(command);
